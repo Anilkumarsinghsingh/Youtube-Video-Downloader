@@ -24,7 +24,8 @@ QUALITY_MAP = {
     "1440p": "1440",
     "2160p (4K - High)": "2160",
 }
-COOKIE_SOURCES = ["Firefox", "Chrome", "Edge", "cookies.txt"]
+# Render-safe cookie options: default none; only use cookies.txt if present
+COOKIE_SOURCES = ["none", "cookies.txt"]
 SPEED_MAP = {
     "Slow": {"concurrent": "1", "chunk": "1M"},
     "Mid": {"concurrent": "10", "chunk": "1M"},
@@ -53,20 +54,19 @@ def build_web_cmd(url, quality, fmt, cookies, speed):
     h = QUALITY_MAP.get(quality, "480")
     s = SPEED_MAP.get(speed, SPEED_MAP["Turbo"])
 
+    # FFmpeg-safe formats: avoid external merging on Render
     if fmt == "MP4 - Video":
-        fmt_str = f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/best[height<={h}][ext=mp4]"
-        base = ["yt-dlp", "-f", fmt_str, "--merge-output-format", "mp4"]
+        fmt_str = f"best[height<={h}][ext=mp4]"
+        base = ["yt-dlp", "-f", fmt_str]
     else:
-        base = ["yt-dlp", "-f", "bestaudio/best", "-x", "--audio-format", "mp3"]
+        fmt_str = "bestaudio[ext=m4a]"
+        base = ["yt-dlp", "-f", fmt_str]
 
-    if cookies == "Firefox":
-        cookie = ["--cookies-from-browser", "firefox"]
-    elif cookies == "Chrome":
-        cookie = ["--cookies-from-browser", "chrome"]
-    elif cookies == "Edge":
-        cookie = ["--cookies-from-browser", "edge"]
-    else:
+    # Cookies: only use cookies.txt if present; otherwise none
+    if cookies == "cookies.txt" and os.path.exists("cookies.txt"):
         cookie = ["--cookies", "cookies.txt"]
+    else:
+        cookie = []
 
     fast = [
         "--concurrent-fragments", s["concurrent"],
@@ -90,22 +90,23 @@ def web_download_worker(job_id, cmd):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1)
         for raw in proc.stdout:
             line = raw.strip()
+            # Always show latest line so user sees progress or errors
+            web_jobs[job_id]["status"]["text"] = line[:160]
+
             parsed = parse_progress_line(line)
             if parsed:
                 pct, speed, eta = parsed
-                web_jobs[job_id]["status"] = {
-                    "pct": pct,
-                    "speed": speed,
-                    "eta": eta or "--",
-                    "text": line[:140]
-                }
+                web_jobs[job_id]["status"].update({"pct": pct, "speed": speed, "eta": eta or "--"})
+
             if "Destination:" in line:
                 m = re.search(r"Destination:\s(.+)", line)
                 if m:
                     web_jobs[job_id]["filename"] = os.path.basename(m.group(1))
+
         ret = proc.wait()
         if ret == 0:
             web_jobs[job_id]["done"] = True
+            # Fallback: pick newest file if Destination wasn't parsed
             if not web_jobs[job_id]["filename"]:
                 files = sorted(
                     [f for f in os.listdir(WEB_DOWNLOADER_DIR) if os.path.isfile(os.path.join(WEB_DOWNLOADER_DIR, f))],
@@ -143,7 +144,7 @@ def home():
         .btn:hover {background:#33E07A;}
         .progress {margin-top:18px;background:#1B224A;border-radius:10px;overflow:hidden;height:22px;}
         .bar {height:100%;width:0%;background:#00B8D4;transition:width 0.3s ease;}
-        .status {margin-top:8px;color:#D8DEE9;font-size:14px;}
+        .status {margin-top:8px;color:#D8DEE9;font-size:14px;min-height:22px;}
         .footer {text-align:center;color:#D8DEE9;margin-top:18px;}
       </style>
     </head>
@@ -183,7 +184,6 @@ def home():
             <div class="bar" id="bar"></div>
           </div>
           <div class="status" id="status"></div>
-          <div class="status" id="doneMsg"></div>
         </div>
         <div class="footer">Files are stored temporarily and deleted shortly after you fetch them.</div>
       </div>
@@ -193,12 +193,10 @@ def home():
         const progress = document.getElementById('progress');
         const bar = document.getElementById('bar');
         const statusEl = document.getElementById('status');
-        const doneMsg = document.getElementById('doneMsg');
 
         form.addEventListener('submit', async (e) => {
           e.preventDefault();
           statusEl.textContent = '';
-          doneMsg.textContent = '';
           bar.style.width = '0%';
           progress.style.display = 'block';
 
@@ -225,9 +223,15 @@ def home():
             bar.style.width = pct + '%';
             statusEl.textContent = `Progress: ${pct.toFixed ? pct.toFixed(1) : pct}% | Speed: ${st.speed || '--'} | ETA: ${st.eta || '--'} | ${st.text || ''}`;
 
+            if (sdata.error) {
+              statusEl.textContent = 'Error: ' + sdata.error;
+              clearInterval(timer);
+              return;
+            }
+
             if (sdata.done && sdata.filename) {
               clearInterval(timer);
-              doneMsg.textContent = 'Completed. Starting download...';
+              statusEl.textContent = 'Completed. Starting download...';
               // Auto-download
               window.location.href = "/fetch/" + encodeURIComponent(sdata.filename);
             }
@@ -245,17 +249,17 @@ def home():
 
 @app.route("/download", methods=["POST"])
 def web_download():
-    data = request.form or request.json or {}
+    data = request.form or {}
     url = data.get("url")
     quality = data.get("quality", "480p")
     fmt = data.get("format", "MP4 - Video")
-    cookies = data.get("cookies", "Firefox")
-    speed_label = data.get("speed", "Turbo")
+    cookies = data.get("cookies", "none")
+    speed = data.get("speed", "Turbo")
 
     if not url:
         return jsonify({"ok": False, "error": "Missing URL"}), 400
 
-    cmd = build_web_cmd(url, quality, fmt, cookies, speed_label)
+    cmd = build_web_cmd(url, quality, fmt, cookies, speed)
     job_id = uuid.uuid4().hex[:12]
     threading.Thread(target=web_download_worker, args=(job_id, cmd), daemon=True).start()
     return jsonify({"ok": True, "job_id": job_id})
@@ -296,5 +300,4 @@ def web_fetch(filename):
 # ---------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # debug=False is important for single-process behavior on Render
     app.run(host="0.0.0.0", port=port, debug=False)
